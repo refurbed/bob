@@ -55,14 +55,14 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
               {{if not .Many}}
                 {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.Create(ctx, exec)
               {{else}}
-                {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.CreateMany(ctx, exec, r.number)
+                {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.CreateMany(ctx, r.number, exec)
               {{end}}
               if err != nil {
                 return err
               }
             {{end -}}
 
-            rel{{$index}}, err := r.o.CreateMany(ctx, exec, r.number)
+            rel{{$index}}, err := r.o.CreateMany(ctx, r.number, exec)
             if err != nil {
               return err
             }
@@ -89,7 +89,7 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
           {{if not .Many}}
             {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.Create(ctx, exec)
           {{else}}
-            {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.CreateMany(ctx, exec, r.number)
+            {{$alias.DownSingular}}{{.Position}}, err := r.{{$alias.DownSingular}}.CreateMany(ctx, r.number, exec)
           {{end}}
           if err != nil {
             return err
