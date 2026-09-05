@@ -1,4 +1,5 @@
 {{$.Importer.Import "context"}}
+{{$.Importer.Import "github.com/stephenafamo/bob"}}
 {{$.Importer.Import "models" (index $.OutputPackages "models") }}
 {{$table := .Table}}
 {{$tAlias := .Aliases.Table $table.Key -}}
@@ -36,6 +37,7 @@ type {{$tAlias.UpSingular}}Template struct {
         r {{$tAlias.DownSingular}}R
     {{- end}}
     f *Factory
+    executor bob.Executor
 
     alreadyPersisted bool
 }

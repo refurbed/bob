@@ -1,8 +1,10 @@
 {{$.Importer.Import "context"}}
+{{$.Importer.Import "github.com/stephenafamo/bob"}}
 {{$.Importer.Import "models" (index $.OutputPackages "models") }}
 {{range $table := .Tables}}{{if $.Relationships.Get $table.Key}}{{$.Importer.Import "unsafe"}}{{end}}{{end}}
 
 type Factory struct {
+    executor bob.Executor
     {{range $table := .Tables}}
     {{ $tAlias := $.Aliases.Table $table.Key -}}
 		base{{$tAlias.UpSingular}}Mods {{$tAlias.UpSingular}}ModSlice
@@ -11,6 +13,10 @@ type Factory struct {
 
 func New() *Factory {
   return &Factory{}
+}
+
+func NewWithExecutor(exec bob.Executor) *Factory {
+  return &Factory{executor: exec}
 }
 
 
@@ -22,6 +28,9 @@ func (f *Factory) New{{$tAlias.UpSingular}}(mods ...{{$tAlias.UpSingular}}Mod) *
 
 func (f *Factory) New{{$tAlias.UpSingular}}WithContext(ctx context.Context, mods ...{{$tAlias.UpSingular}}Mod) *{{$tAlias.UpSingular}}Template {
 	o := &{{$tAlias.UpSingular}}Template{f: f}
+	if f != nil {
+		o.executor = f.executor
+	}
 
   if f != nil {
     f.base{{$tAlias.UpSingular}}Mods.Apply(ctx, o)
@@ -42,6 +51,15 @@ func (f *Factory) FromExisting{{$tAlias.UpSingular}}(ctx context.Context, m *mod
 
 func (f *Factory) fromExisting{{$tAlias.UpSingular}}(ctx context.Context, m *models.{{$tAlias.UpSingular}}) *{{$tAlias.UpSingular}}Template {
 	o := &{{$tAlias.UpSingular}}Template{f: f, alreadyPersisted: true}
+	if f != nil {
+		o.executor = f.executor
+	}
+
+  {{if $.Relationships.Get $table.Key -}}
+  if _, ok := factoryVisitedCtx.Value(ctx); !ok {
+    ctx = factoryVisitedCtx.WithValue(ctx, make(map[uintptr]struct{}))
+  }
+  {{- end}}
 
   {{range $column := $table.Columns -}}
   {{$colAlias := $tAlias.Column $column.Name -}}

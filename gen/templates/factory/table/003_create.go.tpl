@@ -1,6 +1,7 @@
 {{if .Table.Constraints.Primary}}
 {{$.Importer.Import "testing"}}
 {{$.Importer.Import "github.com/stephenafamo/bob"}}
+{{$.Importer.Import "fmt"}}
 {{$.Importer.Import "models" (index $.OutputPackages "models") }}
 {{$table := .Table}}
 {{$tAlias := .Aliases.Table $table.Key}}
@@ -28,10 +29,14 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
 	var err error
 
 	{{range $index, $rel := $.Relationships.Get $table.Key -}}{{if not ($.Tables.RelIsView $rel) -}}
-		{{- if ($table.RelIsRequired $rel)}}{{continue}}{{end -}}
+		{{- $firstSide := index $rel.Sides 0 -}}
+		{{- $directParent := and (not $rel.IsToMany) (eq (len $rel.Sides) 1) (eq $firstSide.Modify "from") -}}
+		{{- if or ($table.RelIsRequired $rel) $directParent}}{{continue}}{{end -}}
 		{{- $relAlias := $tAlias.Relationship .Name -}}
 		{{- $invRel := $.Relationships.GetInverse . -}}
 		{{- $ftable := $.Aliases.Table $rel.Foreign -}}
+		{{- $firstSide := index $rel.Sides 0 -}}
+		{{- $directChild := and (eq (len $rel.Sides) 1) (eq $firstSide.Modify "to") $invRel.Name -}}
 		{{- $invAlias := "" -}}
     {{- if and (not $.NoBackReferencing) $invRel.Name -}}
 			{{- $invAlias = $ftable.Relationship $invRel.Name -}}
@@ -62,10 +67,16 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
               return err
             }
 
-            err = m.Attach{{$relAlias}}(ctx, exec, {{$.Tables.RelArgs $.Aliases $rel}} rel{{$index}}...)
-            if err != nil {
-              return err
-            }
+            {{if $directChild -}}
+              // The child was inserted with this parent from modelsInCreationCtx.
+              // Attaching it again would issue a redundant update and version temporal rows.
+              m.R.{{$relAlias}} = append(m.R.{{$relAlias}}, rel{{$index}}...)
+            {{else -}}
+              err = m.Attach{{$relAlias}}(ctx, exec, {{$.Tables.RelArgs $.Aliases $rel}} rel{{$index}}...)
+              if err != nil {
+                return err
+              }
+            {{end -}}
 					}
 				}
 		{{- else -}}
@@ -90,10 +101,17 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
         if err != nil {
           return err
         }
-        err = m.Attach{{$relAlias}}(ctx, exec, {{$.Tables.RelArgs $.Aliases $rel}} rel{{$index}})
-        if err != nil {
-          return err
-        }
+        {{if $directChild -}}
+          // The child was inserted with this parent from modelsInCreationCtx.
+          // Attaching it again would issue a redundant update and version temporal rows.
+          m.R.{{$relAlias}} = rel{{$index}}
+          m.R.{{$.RelationLoadedName}}.{{$relAlias}} = true
+        {{else -}}
+          err = m.Attach{{$relAlias}}(ctx, exec, {{$.Tables.RelArgs $.Aliases $rel}} rel{{$index}})
+          if err != nil {
+            return err
+          }
+        {{end -}}
 			}
 		{{end}}
 		}
@@ -106,10 +124,16 @@ func (o *{{$tAlias.UpSingular}}Template) insertOptRels(ctx context.Context, exec
 
 // Create builds a {{$tAlias.DownSingular}} and inserts it into the database
 // Relations objects are also inserted and placed in the .R field
-func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Executor) (*models.{{$tAlias.UpSingular}}, error) {
+func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, execs ...bob.Executor) (*models.{{$tAlias.UpSingular}}, error) {
+	exec := o.executor
+	if len(execs) > 0 {
+		exec = execs[0]
+	}
+	if exec == nil {
+		return nil, fmt.Errorf("{{$tAlias.DownSingular}} factory has no executor")
+	}
 	var err error
 	opt := o.BuildSetter()
-	ensureCreatable{{$tAlias.UpSingular}}(opt)
 
 	// Retrieve ancestor models from context to avoid duplicate parent creation.
 	// Parents are keyed by "parent_table:child_table:child_rel_name".
@@ -117,20 +141,46 @@ func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Ex
 	mInCreation, _ := modelsInCreationCtx.Value(ctx)
 
 	{{range $index, $rel := $.Relationships.Get $table.Key -}}
-		{{- if not ($table.RelIsRequired $rel)}}{{continue}}{{end -}}
+		{{- $firstSide := index $rel.Sides 0 -}}
+		{{- $directParent := and (not $rel.IsToMany) (eq (len $rel.Sides) 1) (eq $firstSide.Modify "from") -}}
+		{{- if not $directParent}}{{continue}}{{end -}}
+		{{- $required := $table.RelIsRequired $rel -}}
 		{{- $ftable := $.Aliases.Table .Foreign -}}
 		{{- $relAlias := $tAlias.Relationship .Name -}}
 
 		var rel{{$index}} *models.{{$ftable.UpSingular}}
 
-		if o.r.{{$relAlias}} == nil {
-      if parentModel, found := mInCreation["{{$rel.Foreign}}:{{$table.Key}}:{{$rel.Name}}"]; found {
-        if pModel, ok := parentModel.(*models.{{$ftable.UpSingular}}); ok {
-          rel{{$index}} = pModel
-        }
+		{{/* Explicit FK values are enough to reference an existing parent.
+		     Do not reconstruct the parent relationship graph when the FK is set. */}}
+		{{range $rel.ValuedSides -}}
+			{{- if eq .TableName $table.Key -}}
+				{{range .Mapped -}}
+					{{- if eq .ExternalTable $rel.Foreign -}}
+						{{- $fromColA := index $tAlias.Columns .Column -}}
+		if !opt.{{$fromColA}}.IsValue() {
+					{{- end -}}
+				{{- end -}}
+			{{- end -}}
+		{{- end}}
+		// A surrounding parent factory takes precedence over child base modifiers.
+    if parentModel, found := mInCreation["{{$rel.Foreign}}:{{$table.Key}}:{{$rel.Name}}"]; found {
+      if pModel, ok := parentModel.(*models.{{$ftable.UpSingular}}); ok {
+        rel{{$index}} = pModel
       }
+    }
+
+		if rel{{$index}} == nil && o.r.{{$relAlias}} != nil {
+			if o.r.{{$relAlias}}.o.alreadyPersisted {
+				rel{{$index}} = o.r.{{$relAlias}}.o.Build()
+			} else {
+				rel{{$index}}, err = o.r.{{$relAlias}}.o.Create(ctx, exec)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 
+		{{if $required -}}
 		if rel{{$index}} == nil {
 			if o.r.{{$relAlias}} == nil {
 				{{$tAlias.UpSingular}}Mods.WithNew{{$relAlias}}().Apply(ctx, o)
@@ -145,7 +195,9 @@ func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Ex
 				}
 			}
 		}
+		{{end -}}
 	
+		if rel{{$index}} != nil {
 		{{range $rel.ValuedSides -}}
 			{{- if ne .TableName $table.Key}}{{continue}}{{end -}}
 			{{range .Mapped}}
@@ -155,7 +207,20 @@ func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Ex
 				opt.{{$fromColA}} = {{$.Tables.ColumnAssigner $.CurrentPackage $.Importer $.Types $.Aliases $.Table.Key $rel.Foreign .Column .ExternalColumn $relIndex true}}
 			{{end}}
 		{{- end}}
+		}
+		{{range $rel.ValuedSides -}}
+			{{- if eq .TableName $table.Key -}}
+				{{range .Mapped -}}
+					{{- if eq .ExternalTable $rel.Foreign -}}
+		}
+					{{- end -}}
+				{{- end -}}
+			{{- end -}}
+		{{- end}}
 	{{end}}
+
+	// Fill remaining required columns after relationship-derived foreign keys are set.
+	ensureCreatable{{$tAlias.UpSingular}}(opt)
 
 	m, err := models.{{$tAlias.UpPlural}}.Insert(opt).One(ctx, exec)
 	if err != nil {
@@ -180,11 +245,15 @@ func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Ex
   ctx = modelsInCreationCtx.WithValue(ctx, newMInCreation)
 
 	{{range $index, $rel := $.Relationships.Get $table.Key -}}
-		{{- if not ($table.RelIsRequired $rel) -}}{{continue}}{{end -}}
+		{{- $firstSide := index $rel.Sides 0 -}}
+		{{- $directParent := and (not $rel.IsToMany) (eq (len $rel.Sides) 1) (eq $firstSide.Modify "from") -}}
+		{{- if not $directParent}}{{continue}}{{end -}}
 		{{- $ftable := $.Aliases.Table .Foreign -}}
 		{{- $relAlias := $tAlias.Relationship .Name -}}
-		m.R.{{$relAlias}} = rel{{$index}}
-		m.R.{{$.RelationLoadedName}}.{{$relAlias}} = true
+		if rel{{$index}} != nil {
+			m.R.{{$relAlias}} = rel{{$index}}
+			m.R.{{$.RelationLoadedName}}.{{$relAlias}} = true
+		}
 	{{end}}
 
   if err := o.insertOptRels(ctx, exec, m); err != nil {
@@ -196,8 +265,8 @@ func (o *{{$tAlias.UpSingular}}Template) Create(ctx context.Context, exec bob.Ex
 // MustCreate builds a {{$tAlias.DownSingular}} and inserts it into the database
 // Relations objects are also inserted and placed in the .R field
 // panics if an error occurs
-func (o *{{$tAlias.UpSingular}}Template) MustCreate(ctx context.Context, exec bob.Executor) *models.{{$tAlias.UpSingular}} {
-  m, err := o.Create(ctx, exec)
+func (o *{{$tAlias.UpSingular}}Template) MustCreate(ctx context.Context, execs ...bob.Executor) *models.{{$tAlias.UpSingular}} {
+  m, err := o.Create(ctx, execs...)
   if err != nil {
     panic(err)
   }
@@ -207,9 +276,9 @@ func (o *{{$tAlias.UpSingular}}Template) MustCreate(ctx context.Context, exec bo
 // CreateOrFail builds a {{$tAlias.DownSingular}} and inserts it into the database
 // Relations objects are also inserted and placed in the .R field
 // It calls `tb.Fatal(err)` on the test/benchmark if an error occurs
-func (o *{{$tAlias.UpSingular}}Template) CreateOrFail(ctx context.Context, tb testing.TB, exec bob.Executor) *models.{{$tAlias.UpSingular}} {
+func (o *{{$tAlias.UpSingular}}Template) CreateOrFail(ctx context.Context, tb testing.TB, execs ...bob.Executor) *models.{{$tAlias.UpSingular}} {
   tb.Helper()
-  m, err := o.Create(ctx, exec)
+  m, err := o.Create(ctx, execs...)
   if err != nil {
     tb.Fatal(err)
     return nil
@@ -220,12 +289,12 @@ func (o *{{$tAlias.UpSingular}}Template) CreateOrFail(ctx context.Context, tb te
 
 // CreateMany builds multiple {{$tAlias.DownPlural}} and inserts them into the database
 // Relations objects are also inserted and placed in the .R field
-func (o {{$tAlias.UpSingular}}Template) CreateMany(ctx context.Context, exec bob.Executor, number int) (models.{{$tAlias.UpSingular}}Slice, error) {
+func (o {{$tAlias.UpSingular}}Template) CreateMany(ctx context.Context, number int, execs ...bob.Executor) (models.{{$tAlias.UpSingular}}Slice, error) {
 	var err error
 	m := make(models.{{$tAlias.UpSingular}}Slice, number)
 
 	for i := range m {
-	  m[i], err = o.Create(ctx, exec)
+	  m[i], err = o.Create(ctx, execs...)
 		if err != nil {
 			return nil, err
 		}
@@ -237,8 +306,8 @@ func (o {{$tAlias.UpSingular}}Template) CreateMany(ctx context.Context, exec bob
 // MustCreateMany builds multiple {{$tAlias.DownPlural}} and inserts them into the database
 // Relations objects are also inserted and placed in the .R field
 // panics if an error occurs
-func (o {{$tAlias.UpSingular}}Template) MustCreateMany(ctx context.Context, exec bob.Executor, number int) models.{{$tAlias.UpSingular}}Slice {
-  m, err := o.CreateMany(ctx, exec, number)
+func (o {{$tAlias.UpSingular}}Template) MustCreateMany(ctx context.Context, number int, execs ...bob.Executor) models.{{$tAlias.UpSingular}}Slice {
+  m, err := o.CreateMany(ctx, number, execs...)
   if err != nil {
     panic(err)
   }
@@ -248,9 +317,9 @@ func (o {{$tAlias.UpSingular}}Template) MustCreateMany(ctx context.Context, exec
 // CreateManyOrFail builds multiple {{$tAlias.DownPlural}} and inserts them into the database
 // Relations objects are also inserted and placed in the .R field
 // It calls `tb.Fatal(err)` on the test/benchmark if an error occurs
-func (o {{$tAlias.UpSingular}}Template) CreateManyOrFail(ctx context.Context, tb testing.TB, exec bob.Executor, number int) models.{{$tAlias.UpSingular}}Slice {
+func (o {{$tAlias.UpSingular}}Template) CreateManyOrFail(ctx context.Context, tb testing.TB, number int, execs ...bob.Executor) models.{{$tAlias.UpSingular}}Slice {
   tb.Helper()
-  m, err := o.CreateMany(ctx, exec, number)
+  m, err := o.CreateMany(ctx, number, execs...)
   if err != nil {
     tb.Fatal(err)
     return nil
